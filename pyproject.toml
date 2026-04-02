@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seds9"
+version = "1.0.0"
+description = "Real-time SED plotting from DS9 regions across multi-filter FITS images"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Spood"},
+]
+
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "astropy",
+]
+
+[project.optional-dependencies]
+photutils = ["photutils"]
+all = ["photutils"]
+
+[project.scripts]
+# This creates the `seds9` command available system-wide after pip install
+seds9 = "seds9.core:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
