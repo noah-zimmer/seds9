@@ -14,7 +14,7 @@ pip install .
 pip install ".[all]"
 
 # Or directly from a git repo
-pip install git+https://github.com/yourgroup/seds9.git
+pip install git+https://github.com/noah-zimmer/seds9.git
 ```
 
 After install, the `seds9` command is available everywhere:
@@ -32,7 +32,7 @@ ds9 -title kepler kepler_f770w.fits kepler_f1000w.fits kepler_f1500w.fits &
 # 2. Draw a region on any frame
 
 # 3. Run
-seds9 --target kepler --flux-unit Jy --log
+seds9 --target kepler --coord-system wcs --flux-unit Jy --no-bg
 ```
 
 ## Usage
