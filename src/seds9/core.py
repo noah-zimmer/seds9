@@ -497,13 +497,22 @@ def _parse_angle(s: str) -> float:
 
 def _get_pixel_scale(wcs_obj: WCS) -> float:
     """Get pixel scale in degrees/pixel from WCS."""
-    if hasattr(wcs_obj.wcs, 'cdelt') and wcs_obj.wcs.cdelt[1] != 0:
-        return np.abs(wcs_obj.wcs.cdelt[1])
-    try:
-        cd = wcs_obj.pixel_scale_matrix
-        return np.sqrt(np.abs(np.linalg.det(cd)))
-    except Exception:
-        return 1.0 / 3600.0  # fallback: 1 arcsec/pix
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        # Try CDELT first, but JWST _cal.fits files have CDELT = NaN
+        if hasattr(wcs_obj.wcs, 'cdelt'):
+            cdelt = wcs_obj.wcs.cdelt[1]
+            if np.isfinite(cdelt) and cdelt != 0:
+                return np.abs(cdelt)
+        # Fall back to CD matrix (what JWST actually uses)
+        try:
+            cd = wcs_obj.pixel_scale_matrix
+            scale = np.sqrt(np.abs(np.linalg.det(cd)))
+            if np.isfinite(scale) and scale > 0:
+                return scale
+        except Exception:
+            pass
+    return 1.0 / 3600.0  # fallback: 1 arcsec/pix
 
 
 # =============================================================================
@@ -524,14 +533,16 @@ def region_to_pixel_representation(region: ParsedRegion,
             'vertices_xy': np.ndarray of (N,2) pixel vertices
             'center': (cx, cy) centroid
     """
-    if region.shape in ('circle', 'ellipse'):
-        return _convert_aperture_region(region, wcs_obj)
-    elif region.shape == 'polygon':
-        return _convert_polygon_region(region, wcs_obj)
-    elif region.shape == 'box':
-        return _convert_box_region(region, wcs_obj)
-    else:
-        raise ValueError(f"Unsupported shape: {region.shape}")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        if region.shape in ('circle', 'ellipse'):
+            return _convert_aperture_region(region, wcs_obj)
+        elif region.shape == 'polygon':
+            return _convert_polygon_region(region, wcs_obj)
+        elif region.shape == 'box':
+            return _convert_box_region(region, wcs_obj)
+        else:
+            raise ValueError(f"Unsupported shape: {region.shape}")
 
 
 def _convert_aperture_region(region: ParsedRegion,
@@ -831,22 +842,33 @@ def do_photometry(data: np.ndarray, pixel_rep: dict,
 
 def _photometry_aperture(data: np.ndarray, pixel_rep: dict,
                          bg_annulus_factor) -> Tuple[float, float, int]:
-    """Photometry for circle/ellipse using photutils or fallback."""
+    """Photometry for circle/ellipse using photutils or fallback.
+
+    If photutils raises any error (e.g., NaN propagation in _cal.fits),
+    falls back to the simple mask-based method which handles NaN robustly.
+    """
     shape = pixel_rep['shape']
     center = pixel_rep['center']
     params = pixel_rep['params']
 
     if HAS_PHOTUTILS:
-        return _photometry_aperture_photutils(data, shape, center, params,
-                                              bg_annulus_factor)
-    else:
-        return _photometry_aperture_simple(data, shape, center, params,
-                                           bg_annulus_factor)
+        try:
+            return _photometry_aperture_photutils(data, shape, center, params,
+                                                  bg_annulus_factor)
+        except (ValueError, TypeError, RuntimeError):
+            pass  # fall through to simple method
+
+    return _photometry_aperture_simple(data, shape, center, params,
+                                       bg_annulus_factor)
 
 
 def _photometry_aperture_photutils(data, shape, center, params,
                                    bg_annulus_factor):
-    """Circle/ellipse photometry via photutils. Returns (flux, error, npix)."""
+    """Circle/ellipse photometry via photutils. Returns (flux, error, npix).
+
+    Masks NaN/inf pixels so _cal.fits files (which have NaN outside the
+    detector footprint, flagged pixels, etc.) work correctly.
+    """
     cx, cy = center
 
     if shape == 'circle':
@@ -871,17 +893,30 @@ def _photometry_aperture_photutils(data, shape, center, params,
     else:
         raise ValueError(f"Unsupported aperture shape: {shape}")
 
+    # Mask NaN/inf — True = ignore this pixel
+    nan_mask = ~np.isfinite(data)
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        src_stats = ApertureStats(data, aperture)
+        src_stats = ApertureStats(data, aperture, mask=nan_mask)
         src_sum = src_stats.sum
-        npix = (src_stats.sum_aper_area.value
-                if hasattr(src_stats.sum_aper_area, 'value')
-                else src_stats.sum_aper_area)
-        npix = int(round(npix))
+
+        if not np.isfinite(src_sum):
+            return 0.0, 0.0, 0
+
+        # Number of valid (non-NaN) pixels in the aperture
+        # ApertureStats doesn't report this directly, so we use
+        # geometric area minus the NaN count within the aperture
+        geom_area = (src_stats.sum_aper_area.value
+                     if hasattr(src_stats.sum_aper_area, 'value')
+                     else src_stats.sum_aper_area)
+        nan_stats = ApertureStats(nan_mask.astype(float), aperture)
+        n_nan = nan_stats.sum
+        npix = int(round(geom_area - n_nan)) if np.isfinite(n_nan) else int(round(geom_area))
+        npix = max(npix, 1)
 
         if bg_annulus_factor:
-            bg_stats = ApertureStats(data, bg_aper)
+            bg_stats = ApertureStats(data, bg_aper, mask=nan_mask)
             bg_median = bg_stats.median
             if np.isfinite(bg_median):
                 net_flux = src_sum - bg_median * npix
@@ -1083,7 +1118,9 @@ def load_frame_info(ds9: DS9XPA, frame_num: int,
                     if key not in header and key in hdul[0].header:
                         header[key] = hdul[0].header[key]
 
-            wcs_obj = WCS(header, naxis=2)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                wcs_obj = WCS(header, naxis=2)
 
     except Exception as e:
         print(f"  Frame {frame_num}: error reading {filename}: {e}")
